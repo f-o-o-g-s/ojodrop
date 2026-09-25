@@ -8200,7 +8200,6 @@ impl MilkdropRenderer {
         self.render_impl(None, None, None, None, None);
     }
 
-    /// Texture produced by [`Self::render_to_retained_comp`].
     /// Replace the named image `asset_name` (the part after `sampler_[fw_|fc_|..]`,
     /// e.g. `cover` for `sampler_fc_cover`) with host-supplied RGBA8 pixels, in
     /// place, without rebuilding the preset. The image is resized to the atlas
@@ -8284,6 +8283,7 @@ impl MilkdropRenderer {
         true
     }
 
+    /// Texture produced by [`Self::render_to_retained_comp`].
     pub fn retained_comp_view(&self) -> &wgpu::TextureView {
         &self.comp_view
     }
