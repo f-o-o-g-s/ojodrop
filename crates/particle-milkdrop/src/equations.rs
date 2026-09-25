@@ -1799,8 +1799,10 @@ impl Lexer {
                 while self.peek().is_ascii_alphanumeric() || self.peek() == '_' {
                     self.next();
                 }
+                // ns-eel2 matches names case-insensitively (MilkDrop's
+                // nseel-eval.c compares with strnicmp): `FLen` is `flen`.
                 let s: String = self.chars[start..self.pos].iter().collect();
-                return Tok::Ident(s);
+                return Tok::Ident(s.to_ascii_lowercase());
             }
 
             self.next(); // consume c
@@ -2373,6 +2375,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn identifiers_and_builtins_ignore_case() {
+        // MilkDrop presets mix cases freely (`flen = 512; reg00 = FLen;`).
+        let program =
+            EelProgram::parse("flen=512; reg00=FLen; X=Sin(0)+ABOVE(Bass,1); q1=Q1+1;");
+        let mut env = Env::new();
+        env.insert("bass", 2.0);
+        env.insert("q1", 4.0);
+        let mut state = EelState::new();
+        program.run_with(&mut env, &mut state);
+        assert_eq!(env.get("reg00").copied(), Some(512.0));
+        assert_eq!(env.get("x").copied(), Some(1.0));
+        assert_eq!(env.get("q1").copied(), Some(5.0));
     }
 
     #[test]
