@@ -2870,9 +2870,12 @@ pub struct MilkdropRenderer {
 
     // Per-preset custom-image atlas. Custom sampler calls are rewritten to one
     // of two reserved bindings (linear/point) that share this view.
-    #[allow(dead_code)]
     named_texture_atlas: wgpu::Texture,
     view_named_texture_atlas: wgpu::TextureView,
+    /// The preset's named-image assets in atlas-cell order (lowercase), so a
+    /// host can replace one in place (`set_named_texture`).
+    named_assets: Vec<String>,
+    named_texture_levels: u32,
 
     /// Two dynamically uploaded rows used only when compiled preset code calls
     /// an enhanced-audio helper. Keeping them separate from the named-image
@@ -5139,6 +5142,13 @@ impl MilkdropRenderer {
             btemp_mips3,
             named_texture_atlas,
             view_named_texture_atlas,
+            named_assets: compiled
+                .named_texture_plan
+                .unique_assets
+                .iter()
+                .map(|a| a.to_ascii_lowercase())
+                .collect(),
+            named_texture_levels,
             enhanced_audio_enabled,
             enhanced_fft_texture,
             enhanced_wave_texture,
@@ -8191,6 +8201,89 @@ impl MilkdropRenderer {
     }
 
     /// Texture produced by [`Self::render_to_retained_comp`].
+    /// Replace the named image `asset_name` (the part after `sampler_[fw_|fc_|..]`,
+    /// e.g. `cover` for `sampler_fc_cover`) with host-supplied RGBA8 pixels, in
+    /// place, without rebuilding the preset. The image is resized to the atlas
+    /// cell. Returns `false` when this preset does not sample that name or the
+    /// pixel buffer does not match `width * height * 4`.
+    pub fn set_named_texture(
+        &mut self,
+        asset_name: &str,
+        rgba8: &[u8],
+        width: u32,
+        height: u32,
+    ) -> bool {
+        use crate::named_textures::{
+            copy_layer_with_gutter, NAMED_TEXTURE_ATLAS_GRID, NAMED_TEXTURE_ATLAS_GUTTER,
+        };
+        let Some(index) = self
+            .named_assets
+            .iter()
+            .position(|a| a.eq_ignore_ascii_case(asset_name))
+        else {
+            return false;
+        };
+        if width == 0 || height == 0 || rgba8.len() as u64 != u64::from(width) * u64::from(height) * 4 {
+            return false;
+        }
+        let Some(source) = image::RgbaImage::from_raw(width, height, rgba8.to_vec()) else {
+            return false;
+        };
+        let layer_size = DEFAULT_NAMED_TEXTURE_LAYER_SIZE;
+        let layer = if width == layer_size && height == layer_size {
+            source
+        } else {
+            image::imageops::resize(
+                &source,
+                layer_size,
+                layer_size,
+                image::imageops::FilterType::Triangle,
+            )
+        };
+        let stride = layer_size + NAMED_TEXTURE_ATLAS_GUTTER * 2;
+        let mut cell = vec![0u8; stride as usize * stride as usize * 4];
+        copy_layer_with_gutter(&mut cell, stride, &layer, 0, 0);
+        let index = index as u32;
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.named_texture_atlas,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: (index % NAMED_TEXTURE_ATLAS_GRID) * stride,
+                    y: (index / NAMED_TEXTURE_ATLAS_GRID) * stride,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &cell,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride * 4),
+                rows_per_image: Some(stride),
+            },
+            wgpu::Extent3d {
+                width: stride,
+                height: stride,
+                depth_or_array_layers: 1,
+            },
+        );
+        if self.named_texture_levels > 1 {
+            let mut enc = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("named-texture-mips"),
+                });
+            generate_mip_chain(
+                &self.device,
+                &self.feedback_mip_blitter,
+                &mut enc,
+                &mip_chain_views(&self.named_texture_atlas, self.named_texture_levels),
+            );
+            self.queue.submit(std::iter::once(enc.finish()));
+        }
+        true
+    }
+
     pub fn retained_comp_view(&self) -> &wgpu::TextureView {
         &self.comp_view
     }

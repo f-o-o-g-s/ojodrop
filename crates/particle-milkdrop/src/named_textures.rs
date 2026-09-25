@@ -22,7 +22,10 @@ use crate::preprocess::custom_sampler_names;
 pub const MAX_NAMED_TEXTURE_LAYERS: usize = 16;
 pub const NAMED_TEXTURE_ATLAS_GRID: u32 = 4;
 pub const NAMED_TEXTURE_ATLAS_GUTTER: u32 = 2;
-pub const DEFAULT_NAMED_TEXTURE_LAYER_SIZE: u32 = 256;
+/// Side of one atlas cell. 512 (upstream: 256) keeps a host-supplied album
+/// cover readable at panel size; the atlas grows to ~2k² only for presets that
+/// sample named images.
+pub const DEFAULT_NAMED_TEXTURE_LAYER_SIZE: u32 = 512;
 
 const MAX_SCAN_DEPTH: usize = 8;
 const MAX_INDEXED_FILES: usize = 50_000;
@@ -413,7 +416,7 @@ impl NamedTextureResolver {
     }
 }
 
-fn copy_layer_with_gutter(
+pub(crate) fn copy_layer_with_gutter(
     atlas: &mut [u8],
     atlas_width: u32,
     layer: &image::RgbaImage,
