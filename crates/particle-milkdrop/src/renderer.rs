@@ -2445,6 +2445,25 @@ fn sampler_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
+/// Custom warp group 1: the per-frame UBO sits where every generated fragment
+/// shader expects it (after the sampler pairs); the warp params follow it.
+const WARP_CUSTOM_PERFRAME_BINDING: u32 = (MILKDROP_SAMPLERS.len() * 2) as u32;
+const WARP_CUSTOM_PARAMS_BINDING: u32 = WARP_CUSTOM_PERFRAME_BINDING + 1;
+
+/// The custom-warp vertex shader with its `WarpParams` moved from group 2 into
+/// group 1 (see `warp_custom_bgl`).
+fn warp_custom_vs_wgsl() -> String {
+    const GROUP2: &str = "@group(2) @binding(0) var<uniform> wp: WarpParams;";
+    let src = include_str!("shaders/warp_mesh_vs.wgsl");
+    debug_assert!(src.contains(GROUP2), "warp_mesh_vs.wgsl WarpParams binding moved");
+    src.replace(
+        GROUP2,
+        &format!(
+            "@group(1) @binding({WARP_CUSTOM_PARAMS_BINDING}) var<uniform> wp: WarpParams;"
+        ),
+    )
+}
+
 fn perframe_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     let ubo_binding = (MILKDROP_SAMPLERS.len() * 2) as u32;
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -3678,8 +3697,39 @@ impl MilkdropRenderer {
             }],
         });
 
-        // Comp keeps the original two groups. Custom warp additionally consumes
-        // the default-warp parameter UBO in its vertex shader.
+        // Custom warp's group 1: the per-frame UBO (fragment) plus the
+        // default-warp parameter UBO its vertex shader consumes, in ONE group so
+        // the pipeline fits two bind groups (iced's device requests
+        // `max_bind_groups: 2`).
+        let warp_custom_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("warp-custom-perframe-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: WARP_CUSTOM_PERFRAME_BINDING,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: WARP_CUSTOM_PARAMS_BINDING,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(
+                            std::mem::size_of::<WarpGpuParams>() as u64,
+                        ),
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        // Comp keeps the original two groups.
         let comp_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("comp-pl"),
             bind_group_layouts: &[Some(&sampler_bgl), Some(&perframe_bgl)],
@@ -3687,11 +3737,7 @@ impl MilkdropRenderer {
         });
         let warp_custom_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("warp-custom-pl"),
-            bind_group_layouts: &[
-                Some(&sampler_bgl),
-                Some(&perframe_bgl),
-                Some(&warp_params_bgl),
-            ],
+            bind_group_layouts: &[Some(&sampler_bgl), Some(&warp_custom_bgl)],
             immediate_size: 0,
         });
         // Pipeline layout for blur
@@ -3890,13 +3936,20 @@ impl MilkdropRenderer {
 
         // Perframe bind group
         let ubo_binding = (MILKDROP_SAMPLERS.len() * 2) as u32;
+        // Only the custom warp binds this group, alongside its warp params.
         let perframe_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("perframe-bg"),
-            layout: &perframe_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: ubo_binding,
-                resource: perframe_buf.as_entire_binding(),
-            }],
+            layout: &warp_custom_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: WARP_CUSTOM_PERFRAME_BINDING,
+                    resource: perframe_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: WARP_CUSTOM_PARAMS_BINDING,
+                    resource: warp_params_buf.as_entire_binding(),
+                },
+            ],
         });
         let comp_perframe_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("comp-perframe-bg"),
@@ -4165,7 +4218,7 @@ impl MilkdropRenderer {
         // ── Custom-warp pipeline: warped mesh VS + the per-preset custom warp FS.
         // Uses sampler + perframe + default-warp parameter layouts so it can
         // calculate equation-free UVs in the VS and sample the MilkDrop texture set.
-        let warp_mesh_vs_src = include_str!("shaders/warp_mesh_vs.wgsl");
+        let warp_mesh_vs_src = warp_custom_vs_wgsl();
         let warp_mesh_vs_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("warp-mesh-vs"),
             source: wgpu::ShaderSource::Wgsl(warp_mesh_vs_src.into()),
@@ -9311,8 +9364,8 @@ impl MilkdropRenderer {
                 // Custom warp FS, driven by the warped mesh VS.
                 rp.set_pipeline(&self.warp_custom_pipeline);
                 rp.set_bind_group(0, read_bg, &[]); // sampler set (prev frame)
+                // Group 1 carries both the per-frame and the warp-param UBOs.
                 rp.set_bind_group(1, &self.perframe_bg, &[]);
-                rp.set_bind_group(2, &self.warp_params_bg, &[]);
             } else {
                 // Default warp mesh: sample prev at warped UV, multiply per-vertex decay.
                 let mesh_bg = match (self.write_to_a, live_wrap) {
@@ -10468,6 +10521,14 @@ mod tests {
     fn comp_mesh_adapts_webgl_framebuffer_v_to_wgpu_texture_v() {
         let shader = include_str!("shaders/comp_mesh.wgsl");
         assert!(shader.contains("(1.0 - pos.y) * 0.5"));
+    }
+
+    #[test]
+    fn custom_warp_vs_uses_two_bind_groups() {
+        use crate::renderer::{WARP_CUSTOM_PARAMS_BINDING, warp_custom_vs_wgsl};
+        let src = warp_custom_vs_wgsl();
+        assert!(!src.contains("@group(2)"), "custom warp must fit max_bind_groups = 2");
+        assert!(src.contains(&format!("@group(1) @binding({WARP_CUSTOM_PARAMS_BINDING})")));
     }
 
     #[test]
