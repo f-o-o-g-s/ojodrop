@@ -15,10 +15,11 @@ use crate::named_textures::{
 };
 use crate::parse_milk::{CustomWaveDef, MilkShaders, ShapeBaseVals};
 use crate::preprocess::{
-    custom_sampler_names, fix_glsl_vector_types, glsl_milk_body_to_naga_with_named_textures,
-    glsl_milk_warp_body_to_naga_with_named_textures, hlsl_milk_body_to_naga_with_named_textures,
-    hlsl_milk_warp_body_to_naga_with_named_textures, normalize_milkdrop_sampler_variants,
-    uses_enhanced_audio_helpers, MILKDROP_SAMPLERS,
+    alias_prev_comp, custom_sampler_names, fix_glsl_vector_types,
+    glsl_milk_body_to_naga_with_named_textures, glsl_milk_warp_body_to_naga_with_named_textures,
+    hlsl_milk_body_to_naga_with_named_textures, hlsl_milk_warp_body_to_naga_with_named_textures,
+    normalize_milkdrop_sampler_variants, uses_enhanced_audio_helpers, uses_prev_comp,
+    MILKDROP_SAMPLERS, PREV_COMP_SAMPLER,
 };
 
 // ── Warp mesh constants ──────────────────────────────────────────────────────
@@ -1961,6 +1962,242 @@ pub(crate) fn validate_texture_dims(max_dim: u32, w: u32, h: u32) -> Result<(), 
     Ok(())
 }
 
+/// History for `sampler_prev_comp`: after each COMP pass the COMP output is
+/// copied into `tex` and its mip chain rebuilt, each level the box average of
+/// its footprint in the one above (2x2 for even sizes, a weighted 3-texel span
+/// for odd ones; the shared `TextureBlitter` picks one texel per block, which
+/// makes blur-by-LOD blocky and swimming), so the next frame's COMP can read the previous
+/// picture sharp at LOD 0 or blurred at a higher LOD. The copy flips rows: the
+/// COMP's `uv.y` runs up the picture while texture rows run down, so sampling
+/// the history at a fragment's own `uv` returns what that fragment wrote. `bgs`
+/// are the COMP's sampler bind groups with this texture in the point-named
+/// slot, indexed like the ordinary ones: [a, b, a_clamp, b_clamp].
+struct PrevComp {
+    mips: Vec<wgpu::TextureView>,
+    bgs: [wgpu::BindGroup; 4],
+    flip_pipeline: wgpu::RenderPipeline,
+    flip_bg: wgpu::BindGroup,
+    down_pipeline: wgpu::RenderPipeline,
+    /// `down_bgs[l]` reads level `l` to write level `l + 1`.
+    down_bgs: Vec<wgpu::BindGroup>,
+}
+
+const PREV_COMP_FLIP_WGSL: &str = r#"
+@group(0) @binding(0) var src: texture_2d<f32>;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let x = f32((i << 1u) & 2u);
+    let y = f32(i & 2u);
+    return vec4<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let size = vec2<i32>(textureDimensions(src));
+    return textureLoad(src, vec2<i32>(i32(pos.x), size.y - 1 - i32(pos.y)), 0);
+}
+
+// Box weights of the three source texels from `first` that the destination
+// texel's footprint [lo, lo + span) covers (span is 2 for an even source,
+// n / floor(n / 2) in (2, 3) for an odd one, so no row or column is dropped).
+fn footprint(lo: f32, span: f32, first: f32) -> vec3<f32> {
+    let hi = lo + span;
+    let t = vec3<f32>(first, first + 1.0, first + 2.0);
+    return max(min(t + 1.0, vec3<f32>(hi)) - max(t, vec3<f32>(lo)), vec3<f32>(0.0)) / span;
+}
+
+@fragment
+fn down(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let src_size = vec2<f32>(textureDimensions(src));
+    let dst_size = max(floor(src_size * 0.5), vec2<f32>(1.0));
+    let span = src_size / dst_size;
+    let lo = floor(pos.xy) * span;
+    let first = floor(lo);
+    let wx = footprint(lo.x, span.x, first.x);
+    let wy = footprint(lo.y, span.y, first.y);
+    let last = vec2<i32>(src_size) - vec2<i32>(1, 1);
+    var sum = vec4<f32>(0.0);
+    for (var j = 0; j < 3; j++) {
+        for (var i = 0; i < 3; i++) {
+            let w = wx[i] * wy[j];
+            if (w > 0.0) {
+                let at = min(vec2<i32>(first) + vec2<i32>(i, j), last);
+                sum += textureLoad(src, at, 0) * w;
+            }
+        }
+    }
+    return sum;
+}
+"#;
+
+impl PrevComp {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        w: u32,
+        h: u32,
+        comp_view: &wgpu::TextureView,
+        make_bgs: impl FnOnce((&wgpu::TextureView, &wgpu::Sampler)) -> [wgpu::BindGroup; 4],
+    ) -> Self {
+        let levels = mip_level_count_2d(w, h);
+        // A fresh texture is zeroed: alpha 0 marks "no history yet".
+        let tex = make_tex2d_with_mips(
+            device,
+            queue,
+            w,
+            h,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            levels,
+            None,
+        );
+        let sample_view = tex.create_view(&Default::default());
+        let samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("prev-comp-trilinear-clamp"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let bgs = make_bgs((&sample_view, &samp));
+
+        let flip_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("prev-comp-flip-bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("prev-comp-flip"),
+            source: wgpu::ShaderSource::Wgsl(PREV_COMP_FLIP_WGSL.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("prev-comp-flip-pl"),
+            bind_group_layouts: &[Some(&flip_bgl)],
+            immediate_size: 0,
+        });
+        let make_pipeline = |label: &'static str, entry: &'static str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let flip_pipeline = make_pipeline("prev-comp-flip", "fs");
+        let down_pipeline = make_pipeline("prev-comp-down", "down");
+        let mips = mip_chain_views(&tex, levels);
+        let src_bg = |view: &wgpu::TextureView| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("prev-comp-src-bg"),
+                layout: &flip_bgl,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                }],
+            })
+        };
+        let flip_bg = src_bg(comp_view);
+        let down_bgs = mips[..mips.len() - 1].iter().map(src_bg).collect();
+        Self {
+            mips,
+            bgs,
+            flip_pipeline,
+            flip_bg,
+            down_pipeline,
+            down_bgs,
+        }
+    }
+
+    fn bind_group(&self, write_to_a: bool, live_wrap: bool) -> &wgpu::BindGroup {
+        // The COMP reads the page the warp just wrote.
+        &self.bgs[usize::from(!write_to_a) + 2 * usize::from(!live_wrap)]
+    }
+
+    /// Mark the history empty (alpha 0 on every level), as after a resize.
+    fn clear(&self, enc: &mut wgpu::CommandEncoder) {
+        for view in &self.mips {
+            enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("prev-comp-clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+    }
+
+    /// Copy this frame's COMP output in (flipped) and rebuild the blur levels.
+    fn capture(&self, enc: &mut wgpu::CommandEncoder) {
+        let pass = |enc: &mut wgpu::CommandEncoder,
+                    pipeline: &wgpu::RenderPipeline,
+                    src: &wgpu::BindGroup,
+                    dst: &wgpu::TextureView| {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("prev-comp-capture"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: dst,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(pipeline);
+            rp.set_bind_group(0, src, &[]);
+            rp.draw(0..3, 0..1);
+        };
+        pass(enc, &self.flip_pipeline, &self.flip_bg, &self.mips[0]);
+        for (src, dst) in self.down_bgs.iter().zip(&self.mips[1..]) {
+            pass(enc, &self.down_pipeline, src, dst);
+        }
+    }
+}
+
 fn mip_level_count_2d(w: u32, h: u32) -> u32 {
     let max_dim = w.max(h).max(1);
     u32::BITS - max_dim.leading_zeros()
@@ -2538,6 +2775,7 @@ fn build_sampler_bg(
     samp_clamp: &wgpu::Sampler,
     samp_point: &wgpu::Sampler,
     samp_point_clamp: &wgpu::Sampler,
+    prev_comp: Option<(&wgpu::TextureView, &wgpu::Sampler)>,
 ) -> wgpu::BindGroup {
     use wgpu::{BindGroupEntry, BindingResource};
     let mut entries: Vec<BindGroupEntry<'_>> = Vec::with_capacity(MILKDROP_SAMPLERS.len() * 2);
@@ -2558,6 +2796,11 @@ fn build_sampler_bg(
             "sampler_noise_mq" => (noise_mq_view, repeat_samp),
             "sampler_noise_hq" => (noise_hq_view, repeat_samp),
             "sampler_named_linear" => (named_linear_view, samp_clamp),
+            // A COMP that samples `sampler_prev_comp` has it aliased onto this
+            // slot (see `PREV_COMP_SLOT`); only its COMP bind groups pass this.
+            "sampler_named_point" if prev_comp.is_some() => {
+                prev_comp.expect("guarded by the match arm")
+            }
             "sampler_named_point" => (
                 named_point_view,
                 if enhanced_audio_helpers {
@@ -2666,6 +2909,23 @@ pub fn compile_milkdrop_shader_bodies_from_parts(
              if (darken   != 0.0) ret = ret * ret; \
              if (solarize != 0.0) ret = ret * (1.0 - ret) * 4.0; \
              if (invert   != 0.0) ret = 1.0 - ret;";
+
+    if warp.is_some_and(uses_prev_comp) {
+        return Err(format!(
+            "{PREV_COMP_SAMPLER} is only available to the COMP shader"
+        ));
+    }
+    let comp_prev = comp.filter(|body| uses_prev_comp(body));
+    if let Some(body) = comp_prev {
+        if uses_enhanced_audio_helpers(body) || !custom_sampler_names(body).is_empty() {
+            return Err(format!(
+                "a COMP shader using {PREV_COMP_SAMPLER} cannot also use named textures or \
+                 enhanced-audio helpers"
+            ));
+        }
+    }
+    let comp_aliased = comp_prev.map(alias_prev_comp);
+    let comp = comp_aliased.as_deref().or(comp);
 
     let named_texture_plan = NamedTexturePlan::from_sources([warp, comp].into_iter().flatten());
     let named_bindings = named_texture_plan.shader_rewrite_bindings();
@@ -2954,6 +3214,8 @@ pub struct MilkdropRenderer {
     #[allow(dead_code)]
     comp_tex: wgpu::Texture, // kept alive; comp_view borrows it
     comp_view: wgpu::TextureView,
+    /// Last frame's COMP output for a COMP that samples `sampler_prev_comp`.
+    prev_comp: Option<PrevComp>,
     output_pipeline: wgpu::RenderPipeline,
     #[allow(dead_code)]
     fxaa_bgl: wgpu::BindGroupLayout,
@@ -3286,6 +3548,7 @@ impl MilkdropRenderer {
                 .comp
                 .as_deref()
                 .is_some_and(uses_enhanced_audio_helpers);
+        let prev_comp_enabled = shaders.comp.as_deref().is_some_and(uses_prev_comp);
         let has_named_texture_calls = [shaders.warp.as_deref(), shaders.comp.as_deref()]
             .into_iter()
             .flatten()
@@ -3971,98 +4234,48 @@ impl MilkdropRenderer {
         } else {
             (&view_named_texture_atlas, &view_named_texture_atlas)
         };
-        let bg_read_a = build_sampler_bg(
-            &device,
-            &sampler_bgl,
-            &view_a_sample,
-            &view_blur1_sample,
-            &view_blur2_sample,
-            &view_blur3_sample,
-            &view_noise2d,
-            &view_noise_lq,
-            &view_noise_mq,
-            &view_noise_hq,
-            &view_noise_lite,
-            named_linear_view,
-            named_point_view,
-            enhanced_audio_enabled,
-            &view_noisevol_lq,
-            &view_noisevol_hq,
-            &linear_samp,
-            &linear_samp,
-            &clamp_samp,
-            &point_samp,
-            &point_clamp_samp,
-        );
-        let bg_read_b = build_sampler_bg(
-            &device,
-            &sampler_bgl,
-            &view_b_sample,
-            &view_blur1_sample,
-            &view_blur2_sample,
-            &view_blur3_sample,
-            &view_noise2d,
-            &view_noise_lq,
-            &view_noise_mq,
-            &view_noise_hq,
-            &view_noise_lite,
-            named_linear_view,
-            named_point_view,
-            enhanced_audio_enabled,
-            &view_noisevol_lq,
-            &view_noisevol_hq,
-            &linear_samp,
-            &linear_samp,
-            &clamp_samp,
-            &point_samp,
-            &point_clamp_samp,
-        );
-        let bg_read_a_clamp = build_sampler_bg(
-            &device,
-            &sampler_bgl,
-            &view_a_sample,
-            &view_blur1_sample,
-            &view_blur2_sample,
-            &view_blur3_sample,
-            &view_noise2d,
-            &view_noise_lq,
-            &view_noise_mq,
-            &view_noise_hq,
-            &view_noise_lite,
-            named_linear_view,
-            named_point_view,
-            enhanced_audio_enabled,
-            &view_noisevol_lq,
-            &view_noisevol_hq,
-            &clamp_samp,
-            &linear_samp,
-            &clamp_samp,
-            &point_samp,
-            &point_clamp_samp,
-        );
-        let bg_read_b_clamp = build_sampler_bg(
-            &device,
-            &sampler_bgl,
-            &view_b_sample,
-            &view_blur1_sample,
-            &view_blur2_sample,
-            &view_blur3_sample,
-            &view_noise2d,
-            &view_noise_lq,
-            &view_noise_mq,
-            &view_noise_hq,
-            &view_noise_lite,
-            named_linear_view,
-            named_point_view,
-            enhanced_audio_enabled,
-            &view_noisevol_lq,
-            &view_noisevol_hq,
-            &clamp_samp,
-            &linear_samp,
-            &clamp_samp,
-            &point_samp,
-            &point_clamp_samp,
-        );
+        let read_bg = |main_view: &wgpu::TextureView,
+                       main_samp: &wgpu::Sampler,
+                       prev: Option<(&wgpu::TextureView, &wgpu::Sampler)>| {
+            build_sampler_bg(
+                &device,
+                &sampler_bgl,
+                main_view,
+                &view_blur1_sample,
+                &view_blur2_sample,
+                &view_blur3_sample,
+                &view_noise2d,
+                &view_noise_lq,
+                &view_noise_mq,
+                &view_noise_hq,
+                &view_noise_lite,
+                named_linear_view,
+                named_point_view,
+                enhanced_audio_enabled,
+                &view_noisevol_lq,
+                &view_noisevol_hq,
+                main_samp,
+                &linear_samp,
+                &clamp_samp,
+                &point_samp,
+                &point_clamp_samp,
+                prev,
+            )
+        };
+        let bg_read_a = read_bg(&view_a_sample, &linear_samp, None);
+        let bg_read_b = read_bg(&view_b_sample, &linear_samp, None);
+        let bg_read_a_clamp = read_bg(&view_a_sample, &clamp_samp, None);
+        let bg_read_b_clamp = read_bg(&view_b_sample, &clamp_samp, None);
+        let prev_comp = prev_comp_enabled.then(|| {
+            PrevComp::new(&device, &queue, w, h, &comp_view, |prev| {
+                [
+                    read_bg(&view_a_sample, &linear_samp, Some(prev)),
+                    read_bg(&view_b_sample, &linear_samp, Some(prev)),
+                    read_bg(&view_a_sample, &clamp_samp, Some(prev)),
+                    read_bg(&view_b_sample, &clamp_samp, Some(prev)),
+                ]
+            })
+        });
 
         // Blur bind groups — separable: each level does H (src→temp) then V (temp→level).
         // Clamp sampler avoids wrapping opposite-edge content into the blur near borders.
@@ -5193,6 +5406,7 @@ impl MilkdropRenderer {
             blur_v_pipeline,
             comp_tex,
             comp_view,
+            prev_comp,
             output_pipeline,
             fxaa_bgl,
             fxaa_ubo,
@@ -5628,6 +5842,11 @@ impl MilkdropRenderer {
             &mut encoder,
             &self.feedback_mips_b,
         );
+        // The history belongs to this renderer's own frames; after taking over
+        // another renderer's feedback it must read as "no history yet".
+        if let Some(prev) = self.prev_comp.as_ref() {
+            prev.clear(&mut encoder);
+        }
         self.queue.submit(std::iter::once(encoder.finish()));
         self.write_to_a = other.write_to_a;
         true
@@ -5930,98 +6149,49 @@ impl MilkdropRenderer {
                 &self.view_named_texture_atlas,
             )
         };
-        let bg_read_a = build_sampler_bg(
-            &device,
-            &self.sampler_bgl,
-            &view_a_sample,
-            &view_blur1_sample,
-            &view_blur2_sample,
-            &view_blur3_sample,
-            &self.view_noise2d,
-            &self.view_noise_lq,
-            &self.view_noise_mq,
-            &self.view_noise_hq,
-            &self.view_noise_lite,
-            named_linear_view,
-            named_point_view,
-            self.enhanced_audio_enabled,
-            &self.view_noisevol_lq,
-            &self.view_noisevol_hq,
-            &self.linear_samp,
-            &self.linear_samp,
-            &self.clamp_samp,
-            &self.point_samp,
-            &self.point_clamp_samp,
-        );
-        let bg_read_b = build_sampler_bg(
-            &device,
-            &self.sampler_bgl,
-            &view_b_sample,
-            &view_blur1_sample,
-            &view_blur2_sample,
-            &view_blur3_sample,
-            &self.view_noise2d,
-            &self.view_noise_lq,
-            &self.view_noise_mq,
-            &self.view_noise_hq,
-            &self.view_noise_lite,
-            named_linear_view,
-            named_point_view,
-            self.enhanced_audio_enabled,
-            &self.view_noisevol_lq,
-            &self.view_noisevol_hq,
-            &self.linear_samp,
-            &self.linear_samp,
-            &self.clamp_samp,
-            &self.point_samp,
-            &self.point_clamp_samp,
-        );
-        let bg_read_a_clamp = build_sampler_bg(
-            &device,
-            &self.sampler_bgl,
-            &view_a_sample,
-            &view_blur1_sample,
-            &view_blur2_sample,
-            &view_blur3_sample,
-            &self.view_noise2d,
-            &self.view_noise_lq,
-            &self.view_noise_mq,
-            &self.view_noise_hq,
-            &self.view_noise_lite,
-            named_linear_view,
-            named_point_view,
-            self.enhanced_audio_enabled,
-            &self.view_noisevol_lq,
-            &self.view_noisevol_hq,
-            &self.clamp_samp,
-            &self.linear_samp,
-            &self.clamp_samp,
-            &self.point_samp,
-            &self.point_clamp_samp,
-        );
-        let bg_read_b_clamp = build_sampler_bg(
-            &device,
-            &self.sampler_bgl,
-            &view_b_sample,
-            &view_blur1_sample,
-            &view_blur2_sample,
-            &view_blur3_sample,
-            &self.view_noise2d,
-            &self.view_noise_lq,
-            &self.view_noise_mq,
-            &self.view_noise_hq,
-            &self.view_noise_lite,
-            named_linear_view,
-            named_point_view,
-            self.enhanced_audio_enabled,
-            &self.view_noisevol_lq,
-            &self.view_noisevol_hq,
-            &self.clamp_samp,
-            &self.linear_samp,
-            &self.clamp_samp,
-            &self.point_samp,
-            &self.point_clamp_samp,
-        );
+        let read_bg = |main_view: &wgpu::TextureView,
+                       main_samp: &wgpu::Sampler,
+                       prev: Option<(&wgpu::TextureView, &wgpu::Sampler)>| {
+            build_sampler_bg(
+                &device,
+                &self.sampler_bgl,
+                main_view,
+                &view_blur1_sample,
+                &view_blur2_sample,
+                &view_blur3_sample,
+                &self.view_noise2d,
+                &self.view_noise_lq,
+                &self.view_noise_mq,
+                &self.view_noise_hq,
+                &self.view_noise_lite,
+                named_linear_view,
+                named_point_view,
+                self.enhanced_audio_enabled,
+                &self.view_noisevol_lq,
+                &self.view_noisevol_hq,
+                main_samp,
+                &self.linear_samp,
+                &self.clamp_samp,
+                &self.point_samp,
+                &self.point_clamp_samp,
+                prev,
+            )
+        };
+        let bg_read_a = read_bg(&view_a_sample, &self.linear_samp, None);
+        let bg_read_b = read_bg(&view_b_sample, &self.linear_samp, None);
+        let bg_read_a_clamp = read_bg(&view_a_sample, &self.clamp_samp, None);
+        let bg_read_b_clamp = read_bg(&view_b_sample, &self.clamp_samp, None);
+        // The history restarts empty (alpha 0) at the new size.
+        let prev_comp = self.prev_comp.is_some().then(|| {
+            PrevComp::new(&device, &queue, w, h, &comp_view, |prev| {
+                [
+                    read_bg(&view_a_sample, &self.linear_samp, Some(prev)),
+                    read_bg(&view_b_sample, &self.linear_samp, Some(prev)),
+                    read_bg(&view_a_sample, &self.clamp_samp, Some(prev)),
+                    read_bg(&view_b_sample, &self.clamp_samp, Some(prev)),
+                ]
+            })
+        });
 
         let make_blur_bg = |src_view: &wgpu::TextureView, ubo: &wgpu::Buffer| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -6155,6 +6325,7 @@ impl MilkdropRenderer {
         self.bg_read_b = bg_read_b;
         self.bg_read_a_clamp = bg_read_a_clamp;
         self.bg_read_b_clamp = bg_read_b_clamp;
+        self.prev_comp = prev_comp;
         self.blur1_h_bg_a = blur1_h_bg_a;
         self.blur1_h_bg_b = blur1_h_bg_b;
         self.blur1_v_bg = blur1_v_bg;
@@ -9393,6 +9564,10 @@ impl MilkdropRenderer {
                 &self.bg_read_b_clamp,
             ),
         };
+        let comp_bg = self
+            .prev_comp
+            .as_ref()
+            .map_or(comp_bg, |prev| prev.bind_group(self.write_to_a, live_wrap));
 
         let mut enc = self.device.create_command_encoder(&Default::default());
         if let Some((query_set, boundary_marker, start_index, _)) = timestamp_writes {
@@ -9721,8 +9896,12 @@ impl MilkdropRenderer {
         // --- COMP pass: read from curr, write to the comp target ---
         // With FXAA enabled we render into the offscreen comp intermediate so the
         // FXAA output pass can read it; with FXAA disabled we skip that round-trip
-        // and write the swapchain directly.
-        let comp_target: &wgpu::TextureView = if self.fxaa_enabled || surface_view.is_none() {
+        // and write the swapchain directly. A COMP that reads `sampler_prev_comp`
+        // needs its output in the intermediate to copy, so it always goes the
+        // offscreen route (and through the output pass when drawing to a surface).
+        let comp_offscreen =
+            self.fxaa_enabled || surface_view.is_none() || self.prev_comp.is_some();
+        let comp_target: &wgpu::TextureView = if comp_offscreen {
             &self.comp_view
         } else {
             surface_view.expect("direct output requires a surface")
@@ -9744,7 +9923,7 @@ impl MilkdropRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            rp.set_pipeline(if self.fxaa_enabled || surface_view.is_none() {
+            rp.set_pipeline(if comp_offscreen {
                 &self.comp_pipeline
             } else {
                 &self.comp_direct_pipeline
@@ -9754,6 +9933,10 @@ impl MilkdropRenderer {
             rp.set_vertex_buffer(0, self.comp_vert_buf.slice(..));
             rp.set_index_buffer(self.comp_idx_buf.slice(..), wgpu::IndexFormat::Uint16);
             rp.draw_indexed(0..self.comp_idx_count, 0, 0..1);
+        }
+
+        if let Some(prev) = self.prev_comp.as_ref() {
+            prev.capture(&mut enc);
         }
 
         if let Some(readback) = self.geometry_stage_readback.as_ref() {
@@ -9771,7 +9954,7 @@ impl MilkdropRenderer {
         // Fullscreen triangle covers 100% → LoadOp::Clear (no needless read).
         // Skipped entirely when FXAA is disabled: COMP already wrote the
         // swapchain directly above, so there is nothing to resolve.
-        if self.fxaa_enabled && surface_view.is_some() {
+        if comp_offscreen && surface_view.is_some() {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("fxaa-output"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -11829,6 +12012,262 @@ mod tests {
             renderer.scratch.custom_wave_draws.capacity(),
             custom_wave_draws_capacity
         );
+    }
+
+    // ── sampler_prev_comp: the COMP reads its own previous output ─────────────
+    fn prev_comp_preset(warp: &str, comp: &str) -> crate::parse_milk::MilkShaders {
+        let json = serde_json::json!({
+            "version": 2,
+            "baseVals": { "decay": 0.0, "wave_a": 0.0 },
+            "warp": warp,
+            "comp": comp,
+        });
+        crate::load_json::load(&json.to_string()).expect("prev-comp preset")
+    }
+
+    #[test]
+    fn prev_comp_is_refused_in_the_warp_and_beside_named_textures() {
+        let warp_use = prev_comp_preset(
+            " shader_body { ret = texture(sampler2D(sampler_prev_comp, sampler_prev_comp_samp), uv).rgb; }",
+            " shader_body { ret = vec3(0.0); }",
+        );
+        assert!(super::compile_milkdrop_shader_bodies(&warp_use).is_err());
+        let with_named = prev_comp_preset(
+            " shader_body { ret = texture(sampler_main, uv).rgb; }",
+            " shader_body { ret = texture(sampler_prev_comp, uv).rgb + texture(sampler_rose, uv).rgb; }",
+        );
+        assert!(super::compile_milkdrop_shader_bodies(&with_named).is_err());
+        let fine = prev_comp_preset(
+            " shader_body { ret = vec3(get_fft(0.5)); }",
+            " shader_body { ret = textureLod(sampler2D(sampler_prev_comp, sampler_prev_comp_samp), uv, 3.0).rgb; }",
+        );
+        assert!(super::compile_milkdrop_shader_bodies(&fine).is_ok());
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn prev_comp_carries_the_last_comp_output_and_restarts_empty_on_resize() {
+        let Some((device, queue)) = gpu_device() else {
+            return;
+        };
+        let fmt = wgpu::TextureFormat::Rgba8Unorm;
+        // No history (alpha 0) -> red; red history -> green; green history -> blue.
+        // Even-numbered output pixels read history at a blurred LOD, which must
+        // average to the same flat colour.
+        let preset = prev_comp_preset(
+            " shader_body { ret = texture(sampler_main, uv).rgb; }",
+            " shader_body { \
+               vec4 hs = texture(sampler2D(sampler_prev_comp, sampler_prev_comp_samp), uv); \
+               vec4 hb = textureLod(sampler2D(sampler_prev_comp, sampler_prev_comp_samp), uv, 3.0); \
+               vec4 h = mod(floor(uv.x * texsize.x), 2.0) < 0.5 ? hb : hs; \
+               ret = h.a < 0.5 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, h.r, h.g); }",
+        );
+        let mut r = MilkdropRenderer::new(device.clone(), queue, 64, 64, fmt, &preset)
+            .expect("prev-comp renderer");
+        r.set_geometry_diagnostics_enabled(true);
+        let comp_pixel = |r: &mut MilkdropRenderer| {
+            r.render_to_retained_comp();
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("GPU poll after prev-comp render");
+            let img = r
+                .geometry_stage_images()
+                .expect("diagnostics enabled")
+                .post_comp_rgba;
+            let mid = ((img.len() / 4) / 2 + 16) * 4;
+            (
+                [img[mid], img[mid + 1], img[mid + 2]],
+                [img[mid + 4], img[mid + 5], img[mid + 6]],
+            )
+        };
+        let near = |a: [u8; 3], b: [u8; 3]| a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 2);
+        for expected in [[255, 0, 0], [0, 255, 0], [0, 0, 255], [0, 0, 0]] {
+            let (even, odd) = comp_pixel(&mut r);
+            assert!(
+                near(even, expected),
+                "blurred history {even:?} != {expected:?}"
+            );
+            assert!(near(odd, expected), "sharp history {odd:?} != {expected:?}");
+        }
+        r.try_resize(96, 64).expect("resize");
+        r.set_geometry_diagnostics_enabled(true);
+        let (even, odd) = comp_pixel(&mut r);
+        assert!(
+            near(even, [255, 0, 0]) && near(odd, [255, 0, 0]),
+            "history must restart empty"
+        );
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn prev_comp_reads_back_the_same_pixel_at_the_same_uv() {
+        let Some((device, queue)) = gpu_device() else {
+            return;
+        };
+        let fmt = wgpu::TextureFormat::Rgba8Unorm;
+        // Frame 1 writes a uv gradient; later frames copy their history at the same
+        // uv, so the picture must hold still (no flip, no shift).
+        let preset = prev_comp_preset(
+            " shader_body { ret = texture(sampler_main, uv).rgb; }",
+            " shader_body { \
+               vec4 h = texture(sampler2D(sampler_prev_comp, sampler_prev_comp_samp), uv); \
+               ret = h.a < 0.5 ? vec3(uv.x, uv.y, 0.25) : h.rgb; }",
+        );
+        let mut r = MilkdropRenderer::new(device.clone(), queue, 64, 48, fmt, &preset)
+            .expect("prev-comp renderer");
+        r.set_geometry_diagnostics_enabled(true);
+        let mut frames = Vec::new();
+        for _ in 0..3 {
+            r.render_to_retained_comp();
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("GPU poll after prev-comp render");
+            frames.push(
+                r.geometry_stage_images()
+                    .expect("diagnostics")
+                    .post_comp_rgba,
+            );
+        }
+        let first = &frames[0];
+        // Row 0 of the image is the top of the picture.
+        let top_left_green = first[1];
+        let bottom_left_green = first[(47 * 64) * 4 + 1];
+        assert_ne!(
+            top_left_green, bottom_left_green,
+            "frame 1 must hold a vertical gradient"
+        );
+        for later in &frames[1..] {
+            let worst = first
+                .iter()
+                .zip(later.iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(0);
+            assert!(
+                worst <= 1,
+                "history at uv must return the same pixel (max diff {worst})"
+            );
+        }
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn prev_comp_blur_levels_average_rather_than_pick() {
+        let Some((device, queue)) = gpu_device() else {
+            return;
+        };
+        let fmt = wgpu::TextureFormat::Rgba8Unorm;
+        // Frame 1 draws a one-texel checkerboard; frame 2 shows its LOD 2, which
+        // must be flat mid grey (a picked texel would stay black or white).
+        let preset = prev_comp_preset(
+            " shader_body { ret = texture(sampler_main, uv).rgb; }",
+            " shader_body { \
+               vec4 h = textureLod(sampler2D(sampler_prev_comp, sampler_prev_comp_samp), uv, 2.0); \
+               vec2 px = floor(uv * texsize.xy); \
+               ret = h.a < 0.5 ? vec3(mod(px.x + px.y, 2.0)) : h.rgb; }",
+        );
+        let mut r = MilkdropRenderer::new(device.clone(), queue, 64, 64, fmt, &preset)
+            .expect("prev-comp renderer");
+        r.set_geometry_diagnostics_enabled(true);
+        let mut last = Vec::new();
+        for _ in 0..2 {
+            r.render_to_retained_comp();
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("GPU poll after prev-comp render");
+            last = r
+                .geometry_stage_images()
+                .expect("diagnostics")
+                .post_comp_rgba;
+        }
+        let (lo, hi) = last
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .fold((255u8, 0u8), |(lo, hi), px| (lo.min(px[0]), hi.max(px[0])));
+        assert!(
+            lo >= 120 && hi <= 136,
+            "LOD 2 of a checkerboard must be grey, got {lo}..{hi}"
+        );
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn prev_comp_blur_levels_stay_in_place_at_odd_sizes() {
+        let Some((device, queue)) = gpu_device() else {
+            return;
+        };
+        let fmt = wgpu::TextureFormat::Rgba8Unorm;
+        // A horizontal ramp is its own box blur, so LOD 3 of it must read back
+        // the same ramp away from the edges; a stretched level would drift.
+        let preset = prev_comp_preset(
+            " shader_body { ret = texture(sampler_main, uv).rgb; }",
+            " shader_body { \
+               vec4 h = textureLod(sampler2D(sampler_prev_comp, sampler_prev_comp_samp), uv, 3.0); \
+               ret = h.a < 0.5 ? vec3(uv.x, uv.y, 0.0) : h.rgb; }",
+        );
+        let (w, h) = (101u32, 77u32);
+        let mut r = MilkdropRenderer::new(device.clone(), queue, w, h, fmt, &preset)
+            .expect("prev-comp renderer");
+        r.set_geometry_diagnostics_enabled(true);
+        let mut frames = Vec::new();
+        for _ in 0..2 {
+            r.render_to_retained_comp();
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("GPU poll after prev-comp render");
+            frames.push(
+                r.geometry_stage_images()
+                    .expect("diagnostics")
+                    .post_comp_rgba,
+            );
+        }
+        let mut worst = 0u8;
+        for y in (h / 5)..(h * 4 / 5) {
+            for x in (w / 5)..(w * 4 / 5) {
+                let i = ((y * w + x) * 4) as usize;
+                worst = worst
+                    .max(frames[0][i].abs_diff(frames[1][i]))
+                    .max(frames[0][i + 1].abs_diff(frames[1][i + 1]));
+            }
+        }
+        assert!(worst <= 3, "blurred ramp drifted by {worst} levels");
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn prev_comp_history_clears_when_feedback_is_seeded() {
+        let Some((device, queue)) = gpu_device() else {
+            return;
+        };
+        let fmt = wgpu::TextureFormat::Rgba8Unorm;
+        let preset = prev_comp_preset(
+            " shader_body { ret = texture(sampler_main, uv).rgb; }",
+            " shader_body { \
+               vec4 h = texture(sampler2D(sampler_prev_comp, sampler_prev_comp_samp), uv); \
+               ret = h.a < 0.5 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0); }",
+        );
+        let plain = crate::parse_milk::parse("");
+        let outgoing = MilkdropRenderer::new(device.clone(), queue.clone(), 64, 64, fmt, &plain)
+            .expect("outgoing renderer");
+        let mut r = MilkdropRenderer::new(device.clone(), queue, 64, 64, fmt, &preset)
+            .expect("prev-comp renderer");
+        r.set_geometry_diagnostics_enabled(true);
+        let centre_red = |r: &mut MilkdropRenderer| {
+            r.render_to_retained_comp();
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("GPU poll after prev-comp render");
+            let img = r
+                .geometry_stage_images()
+                .expect("diagnostics")
+                .post_comp_rgba;
+            img[(32 * 64 + 32) * 4]
+        };
+        assert_eq!(centre_red(&mut r), 255, "no history on the first frame");
+        assert_eq!(centre_red(&mut r), 0, "history on the second frame");
+        assert!(r.seed_feedback_from(&outgoing));
+        assert_eq!(centre_red(&mut r), 255, "seeding must clear the history");
     }
 
     // ── Feedback starts black; resize preserves runtime without seeding noise ─────

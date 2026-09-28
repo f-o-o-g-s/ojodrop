@@ -469,6 +469,63 @@ pub const ENHANCED_AUDIO_SAMPLER_ROUTE: MilkdropAuxSamplerRoute =
 pub const ENHANCED_AUDIO_FFT_SAMPLER: &str = "sampler_named_linear";
 pub const ENHANCED_AUDIO_WAVE_SAMPLER: &str = "sampler_named_point";
 
+/// The previous frame's COMP output (nokkvi extension). A COMP shader that
+/// samples `sampler_prev_comp` (with its `sampler_prev_comp_samp` pair) reads
+/// the picture it produced one frame earlier, with a full, box-averaged mip
+/// chain for blur-by-LOD and a trilinear clamp sampler. Alpha is 0 until the
+/// first frame has been written, and again after a resize or once the renderer
+/// takes over another's feedback (`seed_feedback_from`), so a shader can
+/// weight the history by it. The name is aliased onto the point-named slot of
+/// the fixed binding table in the COMP only, which is why a COMP using it can
+/// use neither named textures nor enhanced-audio helpers; the WARP keeps both.
+pub const PREV_COMP_SAMPLER: &str = "sampler_prev_comp";
+pub const PREV_COMP_SLOT: &str = "sampler_named_point";
+
+/// Whether shader text names `sampler_prev_comp` (or its `_samp` pair) as an
+/// identifier; a longer identifier that merely starts with it does not count.
+pub fn uses_prev_comp(source: &str) -> bool {
+    let source = strip_comments(source);
+    let mut offset = 0;
+    while let Some(found) = source[offset..].find(PREV_COMP_SAMPLER) {
+        let start = offset + found;
+        if is_prev_comp_token(&source, start) {
+            return true;
+        }
+        offset = start + PREV_COMP_SAMPLER.len();
+    }
+    false
+}
+
+/// `source[start..]` begins with `sampler_prev_comp`: is it the whole
+/// identifier, or the `_samp` pair, rather than part of a longer name?
+fn is_prev_comp_token(source: &str, start: usize) -> bool {
+    let bytes = source.as_bytes();
+    let before_is_ident = start > 0 && is_ident_byte(bytes[start - 1]);
+    let tail = &source[start + PREV_COMP_SAMPLER.len()..];
+    let ends_here = |t: &str| !t.bytes().next().is_some_and(is_ident_byte);
+    !before_is_ident && (ends_here(tail) || tail.strip_prefix("_samp").is_some_and(ends_here))
+}
+
+/// Rename `sampler_prev_comp` / `sampler_prev_comp_samp` onto the slot the
+/// renderer binds the previous COMP output to. Identifier-boundary aware.
+pub fn alias_prev_comp(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut offset = 0;
+    while let Some(found) = source[offset..].find(PREV_COMP_SAMPLER) {
+        let start = offset + found;
+        let end = start + PREV_COMP_SAMPLER.len();
+        out.push_str(&source[offset..start]);
+        out.push_str(if is_prev_comp_token(source, start) {
+            PREV_COMP_SLOT
+        } else {
+            PREV_COMP_SAMPLER
+        });
+        offset = end;
+    }
+    out.push_str(&source[offset..]);
+    out
+}
+
 const ENHANCED_AUDIO_HELPERS: &[&str] = &[
     "get_fft",
     "get_fft_hz",
@@ -1338,7 +1395,9 @@ fn texture_first_arg_identifiers(src: &str) -> Vec<String> {
 
 fn is_builtin_sampler_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    if matches!(lower.as_str(), "sampler2d" | "sampler3d" | "samplercube") {
+    if matches!(lower.as_str(), "sampler2d" | "sampler3d" | "samplercube")
+        || lower == PREV_COMP_SAMPLER
+    {
         return true;
     }
     if MILK_STANDARD_SAMPLERS
@@ -8576,4 +8635,45 @@ fn split_two_args(s: &str) -> Option<(String, String, usize)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod prev_comp_tests {
+    use super::*;
+
+    #[test]
+    fn prev_comp_is_detected_on_identifier_boundaries_only() {
+        assert!(uses_prev_comp("ret = texture(sampler_prev_comp, uv).rgb;"));
+        assert!(uses_prev_comp(
+            "vec4 h = textureLod(sampler2D(sampler_prev_comp, sampler_prev_comp_samp), uv, 2.0);"
+        ));
+        assert!(!uses_prev_comp("float sampler_prev_comp_extra = 1.0;"));
+        assert!(!uses_prev_comp("float my_sampler_prev_comp = 1.0;"));
+        assert!(!uses_prev_comp(
+            "// texture(sampler_prev_comp, uv)\nret = vec3(0.0);"
+        ));
+    }
+
+    #[test]
+    fn prev_comp_aliases_onto_the_point_named_slot() {
+        assert_eq!(
+            alias_prev_comp(
+                "textureLod(sampler2D(sampler_prev_comp, sampler_prev_comp_samp), uv, 0.0)"
+            ),
+            "textureLod(sampler2D(sampler_named_point, sampler_named_point_samp), uv, 0.0)"
+        );
+        assert_eq!(
+            alias_prev_comp("float sampler_prev_comp_extra = 1.0;"),
+            "float sampler_prev_comp_extra = 1.0;"
+        );
+    }
+
+    #[test]
+    fn prev_comp_is_not_a_named_texture() {
+        assert!(custom_sampler_names("ret = tex2D(sampler_prev_comp, uv).rgb;").is_empty());
+        assert!(custom_sampler_names(
+            "ret = texture(sampler2D(sampler_prev_comp, sampler_prev_comp_samp), uv).rgb;"
+        )
+        .is_empty());
+    }
 }
