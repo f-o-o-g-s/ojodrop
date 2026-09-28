@@ -6179,6 +6179,8 @@ layout(location = 0) out vec4 fragColor;";
         r#"{preamble}
 void main() {{
     vec3 ret = vec3(0.0);
+    // A custom warp may also write the feedback's alpha: a fourth data channel.
+    float ret_alpha = 1.0;
     // uv = warped sample coord from the mesh (DirectX-UV, v=0 top); NO y-flip.
     vec2 uv = vWarpUv;
     // uv_orig = screen position for rad/ang (butterchurn warp.js).
@@ -6194,7 +6196,7 @@ void main() {{
     // vColor=white, i.e. NO extra decay. Multiplying by vDecay here double-decayed
     // custom-warp presets (jelly_space fDecay=0.5 → ×0.5/frame), flattening their
     // slow-growing feedback (the missing tendrils). vDecay stays for the default mesh.
-    fragColor = vec4(ret, 1.0);
+    fragColor = vec4(ret, ret_alpha);
 }}
 "#
     )
@@ -6305,6 +6307,8 @@ float ang;
 {conv_funcs}
 void main() {{
     vec3 ret = vec3(0.0);
+    // A custom warp may also write the feedback's alpha: a fourth data channel.
+    float ret_alpha = 1.0;
     vec2 uv = vWarpUv;
     uv_orig = vUv;
     rad = length(uv_orig - 0.5);
@@ -6312,7 +6316,7 @@ void main() {{
 {conv_inits}
 {conv_inner}
 
-    fragColor = vec4(ret, 1.0);
+    fragColor = vec4(ret, ret_alpha);
 }}
 "#
     )
@@ -7415,6 +7419,8 @@ float ang;
 {hoisted_fns}
 void main() {{
     vec3 ret = vec3(0.0);
+    // A custom warp may also write the feedback's alpha: a fourth data channel.
+    float ret_alpha = 1.0;
     // uv = warped sample coord from the mesh (DirectX-UV, v=0 top); NO y-flip.
     vec2 uv = vWarpUv;
     // uv_orig = screen position for rad/ang (butterchurn warp.js).
@@ -7425,7 +7431,7 @@ void main() {{
 {converted_body}
 
     // Custom warp self-decays — NO extra vDecay multiply (matches the HLSL custom-warp path).
-    fragColor = vec4(ret, 1.0);
+    fragColor = vec4(ret, ret_alpha);
 }}
 "#
     )

@@ -12014,6 +12014,51 @@ mod tests {
         );
     }
 
+    // ── ret_alpha: a custom warp writes the feedback's alpha ──────────────────
+    #[cfg(feature = "app")]
+    #[test]
+    fn warp_ret_alpha_is_kept_in_the_feedback_alpha() {
+        let Some((device, queue)) = gpu_device() else {
+            return;
+        };
+        let fmt = wgpu::TextureFormat::Rgba8Unorm;
+        // The COMP shows the feedback's alpha in red. A warp that never names
+        // `ret_alpha` keeps writing 1.0; one that does keeps its own value, and
+        // reads it back next frame (0.25 -> 0.5 -> 0.75).
+        let comp = " shader_body { ret = vec3(texture(sampler_main, uv).a, 0.0, 0.0); }";
+        let red = |warp: &str, frames: usize| {
+            let preset = prev_comp_preset(warp, comp);
+            let mut r = MilkdropRenderer::new(device.clone(), queue.clone(), 32, 32, fmt, &preset)
+                .expect("ret_alpha renderer");
+            r.set_geometry_diagnostics_enabled(true);
+            let mut out = Vec::new();
+            for _ in 0..frames {
+                r.render_to_retained_comp();
+                device
+                    .poll(wgpu::PollType::wait_indefinitely())
+                    .expect("GPU poll after ret_alpha render");
+                let img = r
+                    .geometry_stage_images()
+                    .expect("diagnostics enabled")
+                    .post_comp_rgba;
+                out.push(img[(img.len() / 4 / 2 + 16) * 4]);
+            }
+            out
+        };
+        assert!(red(" shader_body { ret = vec3(0.5); }", 2)
+            .iter()
+            .all(|&v| v >= 253));
+        let grown = red(
+            " shader_body { ret = vec3(0.0); \
+               float a = frame < 0.5 ? 0.0 : texture(sampler_main, uv).a; \
+               ret_alpha = a + 0.25; }",
+            3,
+        );
+        for (got, want) in grown.iter().zip([64u8, 128, 191]) {
+            assert!(got.abs_diff(want) <= 2, "feedback alpha {grown:?}");
+        }
+    }
+
     // ── sampler_prev_comp: the COMP reads its own previous output ─────────────
     fn prev_comp_preset(warp: &str, comp: &str) -> crate::parse_milk::MilkShaders {
         let json = serde_json::json!({
