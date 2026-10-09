@@ -18,7 +18,7 @@ required-features = ["app"]
 wgpu.workspace = true
 bytemuck.workspace = true
 log.workspace = true
-naga = { version = "29.0.3", features = ["glsl-in", "wgsl-out"] }
+naga = { version = "30.0.1", features = ["glsl-in", "wgsl-out"] }
 serde.workspace = true
 serde_json.workspace = true
 rayon = "1.12"

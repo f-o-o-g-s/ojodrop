@@ -16,9 +16,9 @@ rust-version = "1.92"
 license = "MIT"
 authors = ["sho.run"]
 
-# Pinned to match sho.run's gpux stack (wgpu 29.0.x).
+# Pinned to wgpu 30.0.x, the wgpu iced master uses (nokkvi shares its device).
 [workspace.dependencies]
-wgpu = "29.0.3"
+wgpu = "30.0.1"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 log = "0.4"

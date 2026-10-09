@@ -188,12 +188,14 @@ fn run_headless(milk_path: &str, frames: u32, out_path: &str, synth: bool) {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
+        apply_limit_buckets: false,
     }))
     .or_else(|_| {
         pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::None,
             compatible_surface: None,
             force_fallback_adapter: true,
+            apply_limit_buckets: false,
         }))
     })
     .expect("no wgpu adapter — no GPU/software renderer found");
@@ -309,7 +311,7 @@ fn run_headless(milk_path: &str, frames: u32, out_path: &str, synth: bool) {
     slice.map_async(wgpu::MapMode::Read, |_| {});
     device.poll(wgpu::PollType::wait_indefinitely()).ok();
 
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().expect("map readback buffer");
     // Strip padding: each row is `bytes_per_row` bytes but only `w*4` are pixel data
     let stride = bytes_per_row as usize;
     let row_bytes = (w * 4) as usize;
@@ -356,12 +358,14 @@ fn run_anim(milk_path: &str, frames: u32, out_dir: &str) {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
+        apply_limit_buckets: false,
     }))
     .or_else(|_| {
         pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::None,
             compatible_surface: None,
             force_fallback_adapter: true,
+            apply_limit_buckets: false,
         }))
     })
     .expect("no wgpu adapter");
@@ -450,7 +454,7 @@ fn run_anim(milk_path: &str, frames: u32, out_dir: &str) {
         slice.map_async(wgpu::MapMode::Read, |_| {});
         device.poll(wgpu::PollType::wait_indefinitely()).ok();
 
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("map readback buffer");
         let stride = bytes_per_row as usize;
         let row_bytes = (w * 4) as usize;
         let mut pixels: Vec<u8> = Vec::with_capacity((w * h * 4) as usize);
@@ -523,6 +527,7 @@ impl GpuState {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .expect("no adapter");
         log::info!("adapter: {:?}", adapter.get_info());
@@ -568,6 +573,7 @@ impl GpuState {
                 .unwrap_or(wgpu::CompositeAlphaMode::Opaque),
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
 
@@ -820,7 +826,7 @@ impl GpuState {
 
         let view = frame.texture.create_view(&Default::default());
         self.renderer.render(&view);
-        frame.present();
+        self.queue.present(frame);
     }
 }
 

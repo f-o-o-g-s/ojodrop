@@ -1197,7 +1197,7 @@ fn read_stage_rgb_summary(
     });
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     receiver.recv().ok()?.ok()?;
-    let mapped = slice.get_mapped_range();
+    let mapped = slice.get_mapped_range().ok()?;
     let summary = rgba8_rgb_summary(&mapped, width, height, padded_bytes_per_row);
     drop(mapped);
     buffer.unmap();
@@ -1223,7 +1223,7 @@ fn read_stage_rgba8(
     });
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     receiver.recv().ok()?.ok()?;
-    let mapped = slice.get_mapped_range();
+    let mapped = slice.get_mapped_range().ok()?;
     let mut rgba = Vec::with_capacity(active_bytes_per_row.checked_mul(height as usize)?);
     for row in mapped
         .chunks_exact(padded_bytes_per_row)
@@ -4072,7 +4072,7 @@ impl MilkdropRenderer {
                     module: &comp_mesh_mod,
                     entry_point: Some("vs_main"),
                     compilation_options: Default::default(),
-                    buffers: &[comp_vbl.clone()],
+                    buffers: &[Some(comp_vbl.clone())],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &comp_mod,
@@ -4409,7 +4409,7 @@ impl MilkdropRenderer {
                 module: &warp_mesh_mod,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[warp_vbl.clone()],
+                buffers: &[Some(warp_vbl.clone())],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &warp_mesh_mod,
@@ -4450,7 +4450,7 @@ impl MilkdropRenderer {
                 module: &warp_mesh_vs_mod,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[warp_vbl.clone()],
+                buffers: &[Some(warp_vbl.clone())],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &warp_custom_mod,
@@ -4574,7 +4574,7 @@ impl MilkdropRenderer {
                     module: &shapes_mod,
                     entry_point: Some("vs_shape"),
                     compilation_options: Default::default(),
-                    buffers: &[shape_vbl.clone()],
+                    buffers: &[Some(shape_vbl.clone())],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shapes_mod,
@@ -4621,7 +4621,7 @@ impl MilkdropRenderer {
                     module: &shapes_mod,
                     entry_point: Some("vs_border"),
                     compilation_options: Default::default(),
-                    buffers: &[border_vbl],
+                    buffers: &[Some(border_vbl)],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shapes_mod,
@@ -4847,7 +4847,7 @@ impl MilkdropRenderer {
                         module: &wave_mod,
                         entry_point: Some("vs_main"),
                         compilation_options: Default::default(),
-                        buffers: &[wave_vbl.clone()],
+                        buffers: &[Some(wave_vbl.clone())],
                     },
                     fragment: Some(wgpu::FragmentState {
                         module: &wave_mod,
@@ -4955,7 +4955,7 @@ impl MilkdropRenderer {
                 module: &mv_mod,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[mv_vbl],
+                buffers: &[Some(mv_vbl)],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &mv_mod,
@@ -5020,7 +5020,7 @@ impl MilkdropRenderer {
                     module: &shapes_mod,
                     entry_point: Some("vs_border"),
                     compilation_options: Default::default(),
-                    buffers: &[frame_border_vbl],
+                    buffers: &[Some(frame_border_vbl)],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shapes_mod,
@@ -5102,7 +5102,7 @@ impl MilkdropRenderer {
                 module: &darken_mod,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[darken_vbl],
+                buffers: &[Some(darken_vbl)],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &darken_mod,
@@ -11085,6 +11085,7 @@ mod tests {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .ok()?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
